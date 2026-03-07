@@ -30,7 +30,7 @@ jobs:
       - name: Download llama_jni.cpp from your repo
         # Replace YOUR_GITHUB_USERNAME and YOUR_REPO with your actual values
         run: |
-          curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO/main/llama_jni.cpp -o llama_jni.cpp
+          curl -fsSL https://raw.githubusercontent.com/FluidOS-Linux/llamandroid-jni/main/llama_jni.cpp -o llama_jni.cpp
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
