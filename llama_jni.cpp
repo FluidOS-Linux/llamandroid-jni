@@ -158,7 +158,8 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     fireOnComplete(ic, fullOutput);
 
     // ✅ updated API
-    llama_kv_self_clear(ic->ctx);
+    llama_memory_t mem = llama_get_memory(ic->ctx);
+    llama_memory_seq_rm(mem, -1, -1, -1);
 }
 
 // ── nativeFreeModel ──────────────────────────────────────────────────────────
