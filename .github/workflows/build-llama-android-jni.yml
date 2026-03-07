@@ -1,0 +1,78 @@
+name: Build llama.cpp + JNI for Android ARM64
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggerganov/llama.cpp
+          ref: master
+
+      - name: Add JNI bridge source
+        run: |
+          # Copy our JNI bridge into the llama.cpp source tree
+          cat << 'EOF' > llama_jni.cpp
+          // (contents injected by CI — see repo)
+          EOF
+
+      - name: Upload llama_jni.cpp
+        # We'll just grab it from the repo instead
+        run: echo "JNI file will be downloaded in next step"
+
+      - name: Download llama_jni.cpp from your repo
+        # Replace YOUR_GITHUB_USERNAME and YOUR_REPO with your actual values
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/FluidOS-Linux/llamandroid-jni/main/llama_jni.cpp -o llama_jni.cpp
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and CMake
+        run: echo "y" | sdkmanager "ndk;26.3.11579264" "cmake;3.22.1"
+
+      - name: Build llama.cpp + JNI bridge for Android ARM64
+        run: |
+          export ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/26.3.11579264
+          mkdir build-android && cd build-android
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_CXX_FLAGS="-I../include -I../ggml/include"
+          cmake --build . --config Release -j4
+
+          # Now compile our JNI bridge as a shared lib, linking against libllama
+          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++ \
+            -shared -fPIC \
+            -I../include \
+            -I../ggml/include \
+            -I$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
+            ../llama_jni.cpp \
+            -L. \
+            -lllama -lggml \
+            -o libllamajni.so
+
+      - name: Collect all .so files
+        run: |
+          mkdir output
+          find build-android -name "*.so" -exec cp {} output/ \;
+          ls -lh output/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-android-arm64-jni
+          path: output/*.so
+          retention-days: 30
