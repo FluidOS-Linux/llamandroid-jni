@@ -30,7 +30,7 @@ jobs:
       - name: Download llama_jni.cpp from your repo
         # Replace YOUR_GITHUB_USERNAME and YOUR_REPO with your actual values
         run: |
-          curl -fsSL https://raw.githubusercontent.com/FluidOS-Linux/llamandroid-jni/main/llama_jni.cpp -o llama_jni.cpp
+          curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO/main/llama_jni.cpp -o llama_jni.cpp
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
@@ -53,6 +53,10 @@ jobs:
             -DCMAKE_CXX_FLAGS="-I../include -I../ggml/include"
           cmake --build . --config Release -j4
 
+          # Find where the .so files actually ended up
+          SODIR=$(find . -name "libllama.so" -printf "%h\n" | head -1)
+          echo "Found .so files in: $SODIR"
+
           # Now compile our JNI bridge as a shared lib, linking against libllama
           $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++ \
             -shared -fPIC \
@@ -60,9 +64,9 @@ jobs:
             -I../ggml/include \
             -I$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
             ../llama_jni.cpp \
-            -L. \
-            -lllama -lggml \
-            -o libllamajni.so
+            -L$SODIR \
+            -lllama -lggml -lggml-base \
+            -o $SODIR/libllamajni.so
 
       - name: Collect all .so files
         run: |
