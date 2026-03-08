@@ -1,4 +1,4 @@
-name: Build llama.cpp + JNI for Android ARM64
+name: Build llama.cpp + JNI for Android ARM64 (fat .so)
 
 on:
   push:
@@ -16,19 +16,7 @@ jobs:
           repository: ggerganov/llama.cpp
           ref: master
 
-      - name: Add JNI bridge source
-        run: |
-          # Copy our JNI bridge into the llama.cpp source tree
-          cat << 'EOF' > llama_jni.cpp
-          // (contents injected by CI — see repo)
-          EOF
-
-      - name: Upload llama_jni.cpp
-        # We'll just grab it from the repo instead
-        run: echo "JNI file will be downloaded in next step"
-
       - name: Download llama_jni.cpp from your repo
-        # Replace YOUR_GITHUB_USERNAME and YOUR_REPO with your actual values
         run: |
           curl -fsSL https://raw.githubusercontent.com/FluidOS-Linux/llamandroid-jni/main/llama_jni.cpp -o llama_jni.cpp
 
@@ -38,9 +26,13 @@ jobs:
       - name: Install NDK and CMake
         run: echo "y" | sdkmanager "ndk;26.3.11579264" "cmake;3.22.1"
 
-      - name: Build llama.cpp + JNI bridge for Android ARM64
+      - name: Build llama.cpp static libs + fat JNI .so for Android ARM64
         run: |
           export ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/26.3.11579264
+          export CXX=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++
+          export AR=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+
+          # ── Step 1: Build llama.cpp as STATIC libs ──────────────────────────
           mkdir build-android && cd build-android
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
@@ -49,34 +41,36 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_CXX_FLAGS="-I../include -I../ggml/include"
           cmake --build . --config Release -j4
+          cd ..
 
-          # Find where the .so files actually ended up
-          SODIR=$(find . -name "libllama.so" -printf "%h\n" | head -1)
-          echo "Found .so files in: $SODIR"
+          # ── Step 2: Find all static libs ────────────────────────────────────
+          echo "Static libs found:"
+          find build-android -name "*.a" | sort
+          STATIC_LIBS=$(find build-android -name "*.a" | tr '\n' ' ')
 
-          # Now compile our JNI bridge as a shared lib, linking against libllama
-          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++ \
+          # ── Step 3: Compile fat libllamajni.so with everything linked in ────
+          mkdir -p output
+          $CXX \
             -shared -fPIC \
-            -I../include \
-            -I../ggml/include \
+            -I./include \
+            -I./ggml/include \
             -I$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
-            ../llama_jni.cpp \
-            -L$SODIR \
-            -lllama -lggml -lggml-base \
-            -o $SODIR/libllamajni.so
+            llama_jni.cpp \
+            -Wl,--whole-archive \
+            $STATIC_LIBS \
+            -Wl,--no-whole-archive \
+            -llog -lm -lz -landroid \
+            -o output/libllamajni.so
 
-      - name: Collect all .so files
-        run: |
-          mkdir output
-          find build-android -name "*.so" -exec cp {} output/ \;
-          ls -lh output/
+          echo "✅ Fat .so built:"
+          ls -lh output/libllamajni.so
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama-android-arm64-jni
-          path: output/*.so
+          name: llama-android-arm64-fat-jni
+          path: output/libllamajni.so
           retention-days: 30
