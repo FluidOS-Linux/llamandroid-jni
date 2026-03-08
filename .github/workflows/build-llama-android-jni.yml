@@ -33,6 +33,13 @@ jobs:
           export CXX=$TOOLCHAIN/bin/aarch64-linux-android28-clang++
           export SYSROOT=$TOOLCHAIN/sysroot
 
+          # ── Explicit aarch64 libc++ paths (no find, no wrong arch) ──────────
+          export LIBCXX=$SYSROOT/usr/lib/aarch64-linux-android/libc++_static.a
+          export LIBCXXABI=$SYSROOT/usr/lib/aarch64-linux-android/libc++abi.a
+
+          echo "Checking libc++ paths:"
+          ls -lh $LIBCXX $LIBCXXABI
+
           # ── Step 1: Build llama.cpp as STATIC libs ───────────────────────────
           mkdir build-android && cd build-android
           cmake .. \
@@ -53,17 +60,7 @@ jobs:
           find build-android -name "*.a" | sort
           STATIC_LIBS=$(find build-android -name "*.a" | tr '\n' ' ')
 
-          # ── Step 3: Find libc++ static libs in NDK sysroot ──────────────────
-          # NDK puts them under sysroot/usr/lib/<triple>/
-          LIBCXX_STATIC=$(find $SYSROOT -name "libc++_static.a" | head -1)
-          LIBCXXABI_STATIC=$(find $SYSROOT -name "libc++abi.a" | head -1)
-          echo "libc++_static.a: $LIBCXX_STATIC"
-          echo "libc++abi.a:     $LIBCXXABI_STATIC"
-
-          # ── Step 4: Compile fat libllamajni.so ──────────────────────────────
-          # Key flags:
-          #   -nostdlib++              don't auto-link libc++_shared
-          #   explicit static libs     bake libc++ in directly
+          # ── Step 3: Compile fat libllamajni.so ──────────────────────────────
           mkdir -p output
           $CXX \
             -shared -fPIC \
@@ -75,8 +72,8 @@ jobs:
             llama_jni.cpp \
             -Wl,--whole-archive \
             $STATIC_LIBS \
-            $LIBCXX_STATIC \
-            $LIBCXXABI_STATIC \
+            $LIBCXX \
+            $LIBCXXABI \
             -Wl,--no-whole-archive \
             -llog -lm -lz -landroid -ldl -lc \
             -o output/libllamajni.so
