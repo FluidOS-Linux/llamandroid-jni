@@ -30,14 +30,14 @@ jobs:
         run: |
           export ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/26.3.11579264
           export CXX=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++
-          export AR=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
 
-          # ── Step 1: Build llama.cpp as STATIC libs ──────────────────────────
+          # ── Step 1: Build llama.cpp as STATIC libs with static libc++ ───────
           mkdir build-android && cd build-android
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
@@ -51,7 +51,11 @@ jobs:
           find build-android -name "*.a" | sort
           STATIC_LIBS=$(find build-android -name "*.a" | tr '\n' ' ')
 
-          # ── Step 3: Compile fat libllamajni.so with everything linked in ────
+          # ── Step 3: Find libc++_static.a from NDK ───────────────────────────
+          LIBCXX=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a
+          LIBCXXABI=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a
+
+          # ── Step 4: Compile fat libllamajni.so with everything linked in ────
           mkdir -p output
           $CXX \
             -shared -fPIC \
@@ -61,6 +65,8 @@ jobs:
             llama_jni.cpp \
             -Wl,--whole-archive \
             $STATIC_LIBS \
+            $LIBCXX \
+            $LIBCXXABI \
             -Wl,--no-whole-archive \
             -llog -lm -lz -landroid \
             -o output/libllamajni.so
