@@ -29,9 +29,11 @@ jobs:
       - name: Build llama.cpp static libs + fat JNI .so for Android ARM64
         run: |
           export ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/26.3.11579264
-          export CXX=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++
+          export TOOLCHAIN=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64
+          export CXX=$TOOLCHAIN/bin/aarch64-linux-android28-clang++
+          export SYSROOT=$TOOLCHAIN/sysroot
 
-          # ── Step 1: Build llama.cpp as STATIC libs with static libc++ ───────
+          # ── Step 1: Build llama.cpp as STATIC libs ───────────────────────────
           mkdir build-android && cd build-android
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
@@ -46,33 +48,44 @@ jobs:
           cmake --build . --config Release -j4
           cd ..
 
-          # ── Step 2: Find all static libs ────────────────────────────────────
+          # ── Step 2: Collect all static libs ─────────────────────────────────
           echo "Static libs found:"
           find build-android -name "*.a" | sort
           STATIC_LIBS=$(find build-android -name "*.a" | tr '\n' ' ')
 
-          # ── Step 3: Find libc++_static.a from NDK ───────────────────────────
-          LIBCXX=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a
-          LIBCXXABI=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a
+          # ── Step 3: Find libc++ static libs in NDK sysroot ──────────────────
+          # NDK puts them under sysroot/usr/lib/<triple>/
+          LIBCXX_STATIC=$(find $SYSROOT -name "libc++_static.a" | head -1)
+          LIBCXXABI_STATIC=$(find $SYSROOT -name "libc++abi.a" | head -1)
+          echo "libc++_static.a: $LIBCXX_STATIC"
+          echo "libc++abi.a:     $LIBCXXABI_STATIC"
 
-          # ── Step 4: Compile fat libllamajni.so with everything linked in ────
+          # ── Step 4: Compile fat libllamajni.so ──────────────────────────────
+          # Key flags:
+          #   -nostdlib++              don't auto-link libc++_shared
+          #   explicit static libs     bake libc++ in directly
           mkdir -p output
           $CXX \
             -shared -fPIC \
+            -nostdlib++ \
             -I./include \
             -I./ggml/include \
-            -I$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
+            -I$SYSROOT/usr/include \
+            -I$SYSROOT/usr/include/aarch64-linux-android \
             llama_jni.cpp \
             -Wl,--whole-archive \
             $STATIC_LIBS \
-            $LIBCXX \
-            $LIBCXXABI \
+            $LIBCXX_STATIC \
+            $LIBCXXABI_STATIC \
             -Wl,--no-whole-archive \
-            -llog -lm -lz -landroid \
+            -llog -lm -lz -landroid -ldl -lc \
             -o output/libllamajni.so
 
           echo "✅ Fat .so built:"
           ls -lh output/libllamajni.so
+
+          echo "Dependencies:"
+          $TOOLCHAIN/bin/llvm-readelf -d output/libllamajni.so | grep NEEDED
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
