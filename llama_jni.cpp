@@ -9,6 +9,9 @@ struct InferenceContext {
     llama_context* ctx;
     JavaVM*        jvm;
     jobject        javaObj;
+    // Store context params so we can recreate ctx between inferences
+    uint32_t       n_ctx;
+    uint32_t       n_threads;
 };
 
 static void fireOnToken(InferenceContext* ic, const std::string& token) {
@@ -62,9 +65,11 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeLoadModel(
     }
 
     InferenceContext* ic = new InferenceContext();
-    ic->model   = model;
-    ic->ctx     = ctx;
-    ic->javaObj = env->NewGlobalRef(obj);
+    ic->model     = model;
+    ic->ctx       = ctx;
+    ic->n_ctx     = (uint32_t) contextSize;
+    ic->n_threads = (uint32_t) threads;
+    ic->javaObj   = env->NewGlobalRef(obj);
     env->GetJavaVM(&ic->jvm);
 
     return (jlong) ic;
@@ -78,18 +83,27 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     InferenceContext* ic = (InferenceContext*) handle;
     if (!ic) return;
 
+    // ── FIX: Recreate the llama_context before each inference ────────────────
+    // llama_kv_cache_clear was removed in recent master, and llama_memory_seq_rm
+    // with seq_id=-1 does not fully reset internal position state.
+    // Recreating the context is the only API-stable way to guarantee a clean
+    // slate. The model weights stay loaded in RAM — only the small KV buffer
+    // (~few MB for 2048 ctx) is freed and reallocated, which takes ~1-2ms.
+    llama_free(ic->ctx);
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx     = ic->n_ctx;
+    cparams.n_threads = ic->n_threads;
+    ic->ctx = llama_init_from_model(ic->model, cparams);
+    if (!ic->ctx) {
+        fireOnComplete(ic, "[context reset failed]");
+        return;
+    }
+
     const char* promptStr = env->GetStringUTFChars(prompt, nullptr);
     std::string promptCpp(promptStr);
     env->ReleaseStringUTFChars(prompt, promptStr);
 
     const llama_vocab* vocab = llama_model_get_vocab(ic->model);
-
-    // ── FIX: Fully reset context state before each inference ────────────────
-    // llama_kv_cache_clear is the correct, stable API for wiping the KV cache.
-    // The old llama_memory_seq_rm approach only removes sequences but leaves
-    // the context's internal "n_past" position counter dirty, causing the
-    // second decode call to write into already-used slots → crash/OOM.
-    llama_kv_cache_clear(ic->ctx);
 
     // Tokenize with auto-sizing buffer
     int bufSize = (int)promptCpp.size() + 128;
@@ -113,9 +127,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         return;
     }
 
-    // ── FIX: Create sampler fresh each call, free at end ────────────────────
-    // Reusing a sampler across calls carries stale repetition-penalty state,
-    // which can cause degenerate output or illegal memory access on 2nd call.
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
 
@@ -143,9 +154,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
             batchCount = 0;
         }
 
-        // ── FIX: Accept the sampled token into sampler state ────────────────
-        // Without this, greedy sampler doesn't update its internal last-token
-        // state, which breaks repetition avoidance on longer outputs.
         llama_sampler_accept(sampler, id);
 
         llama_batch next = llama_batch_get_one(&id, 1);
