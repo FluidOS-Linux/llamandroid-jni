@@ -84,6 +84,13 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
 
     const llama_vocab* vocab = llama_model_get_vocab(ic->model);
 
+    // ── FIX: Fully reset context state before each inference ────────────────
+    // llama_kv_cache_clear is the correct, stable API for wiping the KV cache.
+    // The old llama_memory_seq_rm approach only removes sequences but leaves
+    // the context's internal "n_past" position counter dirty, causing the
+    // second decode call to write into already-used slots → crash/OOM.
+    llama_kv_cache_clear(ic->ctx);
+
     // Tokenize with auto-sizing buffer
     int bufSize = (int)promptCpp.size() + 128;
     std::vector<llama_token> tokens(bufSize);
@@ -99,10 +106,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     if (nTokens < 0) { fireOnComplete(ic, "[tokenization failed]"); return; }
     tokens.resize(nTokens);
 
-    // Clear KV cache so second+ calls don't OOM
-    llama_memory_t mem = llama_get_memory(ic->ctx);
-    if (mem) llama_memory_seq_rm(mem, -1, -1, -1);
-
     // Decode prompt
     llama_batch batch = llama_batch_get_one(tokens.data(), nTokens);
     if (llama_decode(ic->ctx, batch) != 0) {
@@ -110,6 +113,9 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         return;
     }
 
+    // ── FIX: Create sampler fresh each call, free at end ────────────────────
+    // Reusing a sampler across calls carries stale repetition-penalty state,
+    // which can cause degenerate output or illegal memory access on 2nd call.
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
 
@@ -136,6 +142,11 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
             tokenBatch.clear();
             batchCount = 0;
         }
+
+        // ── FIX: Accept the sampled token into sampler state ────────────────
+        // Without this, greedy sampler doesn't update its internal last-token
+        // state, which breaks repetition avoidance on longer outputs.
+        llama_sampler_accept(sampler, id);
 
         llama_batch next = llama_batch_get_one(&id, 1);
         if (llama_decode(ic->ctx, next) != 0) break;
