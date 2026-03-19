@@ -100,7 +100,8 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     tokens.resize(nTokens);
 
     // Clear KV cache so second+ calls don't OOM
-    llama_kv_self_clear(ic->ctx);
+    llama_memory_t mem = llama_get_memory(ic->ctx);
+    if (mem) llama_memory_seq_rm(mem, -1, -1, -1);
 
     // Decode prompt
     llama_batch batch = llama_batch_get_one(tokens.data(), nTokens);
