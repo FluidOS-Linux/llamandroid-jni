@@ -78,47 +78,29 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     InferenceContext* ic = (InferenceContext*) handle;
     if (!ic) return;
 
-    // ── Clear KV cache before each inference ────────────────────────────────
-    // This is the correct modern API replacing llama_kv_self_clear
-    llama_memory_t mem = llama_get_memory(ic->ctx);
-    if (mem) llama_memory_seq_rm(mem, -1, -1, -1);
-
     const char* promptStr = env->GetStringUTFChars(prompt, nullptr);
     std::string promptCpp(promptStr);
     env->ReleaseStringUTFChars(prompt, promptStr);
 
     const llama_vocab* vocab = llama_model_get_vocab(ic->model);
 
-    // Tokenize
-    std::vector<llama_token> tokens(promptCpp.size() + 64);
+    // Tokenize with auto-sizing buffer
+    int bufSize = (int)promptCpp.size() + 128;
+    std::vector<llama_token> tokens(bufSize);
     int nTokens = llama_tokenize(
-        vocab,
-        promptCpp.c_str(),
-        (int) promptCpp.size(),
-        tokens.data(),
-        (int) tokens.size(),
-        true,   // add_special (BOS)
-        false   // parse_special
-    );
-
+        vocab, promptCpp.c_str(), (int)promptCpp.size(),
+        tokens.data(), (int)tokens.size(), true, false);
     if (nTokens < 0) {
-        // Retry with larger buffer
-        tokens.resize(-nTokens + 64);
+        tokens.resize(-nTokens + 1);
         nTokens = llama_tokenize(
-            vocab,
-            promptCpp.c_str(),
-            (int) promptCpp.size(),
-            tokens.data(),
-            (int) tokens.size(),
-            true,
-            false
-        );
-        if (nTokens < 0) {
-            fireOnComplete(ic, "[tokenization failed]");
-            return;
-        }
+            vocab, promptCpp.c_str(), (int)promptCpp.size(),
+            tokens.data(), (int)tokens.size(), true, false);
     }
+    if (nTokens < 0) { fireOnComplete(ic, "[tokenization failed]"); return; }
     tokens.resize(nTokens);
+
+    // Clear KV cache so second+ calls don't OOM
+    llama_kv_self_clear(ic->ctx);
 
     // Decode prompt
     llama_batch batch = llama_batch_get_one(tokens.data(), nTokens);
@@ -127,7 +109,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         return;
     }
 
-    // Sample tokens
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
 
@@ -136,9 +117,8 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     int batchCount = 0;
     const int BATCH_SIZE = 6;
 
-    for (int i = 0; i < (int) maxTokens; i++) {
+    for (int i = 0; i < (int)maxTokens; i++) {
         llama_token id = llama_sampler_sample(sampler, ic->ctx, -1);
-
         if (llama_vocab_is_eog(vocab, id)) break;
 
         char buf[256];
@@ -161,7 +141,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     }
 
     llama_sampler_free(sampler);
-
     if (!tokenBatch.empty()) fireOnToken(ic, tokenBatch);
     fireOnComplete(ic, fullOutput);
 }
