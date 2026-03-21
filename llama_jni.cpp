@@ -6,29 +6,21 @@
 
 // ── Backend init guard ────────────────────────────────────────────────────────
 // llama_backend_init() must be called exactly once per process.
-// Calling it multiple times (e.g. load → free → load) or calling
-// llama_backend_free() mid-session corrupts global GGML state.
 static bool gBackendInitialized = false;
 
 struct InferenceContext {
     llama_model*   model;
     llama_context* ctx;
     JavaVM*        jvm;
-    jobject        javaObj;   // GlobalRef to the LlamaAndroid Java object
+    jobject        javaObj;
     uint32_t       n_ctx;
     uint32_t       n_threads;
 };
 
-// ── CRITICAL FIX: do NOT use AttachCurrentThread / DetachCurrentThread here ──
-//
-// These functions are called from nativeInfer(), which runs on the Java
-// ExecutorService thread.  That thread is already a JVM-managed Java thread —
-// it is already "attached".  Calling DetachCurrentThread() on an already-
-// attached Java thread permanently detaches it from the JVM.  Any subsequent
-// JNI call from that thread (the very next token) causes a SIGSEGV crash.
-//
-// The correct fix: receive the JNIEnv* that the JVM already handed us in
-// nativeInfer() and pass it straight through.  No attach/detach needed.
+// ── Fire helpers ─────────────────────────────────────────────────────────────
+// IMPORTANT: do NOT call AttachCurrentThread / DetachCurrentThread here.
+// nativeInfer runs on a Java ExecutorService thread which is already attached.
+// Detaching it permanently breaks all subsequent JNI calls from that thread.
 
 static void fireOnToken(JNIEnv* env, InferenceContext* ic, const std::string& token) {
     jclass    cls  = env->GetObjectClass(ic->javaObj);
@@ -57,7 +49,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeLoadModel(
 
     const char* path = env->GetStringUTFChars(modelPath, nullptr);
 
-    // Only ever initialise the backend once per process lifetime.
     if (!gBackendInitialized) {
         llama_backend_init();
         gBackendInitialized = true;
@@ -96,14 +87,17 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeLoadModel(
 extern "C" JNIEXPORT void JNICALL
 Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         JNIEnv* env, jobject /*obj*/,
-        jlong handle, jstring prompt, jint maxTokens) {
+        jlong handle, jstring prompt, jint maxTokens, jstring stopStr) {
 
     InferenceContext* ic = (InferenceContext*) handle;
     if (!ic) return;
 
-    // Recreate the context before each inference for a clean KV-cache slate.
-    // The model weights stay in RAM; only the small KV buffer (~few MB) is
-    // freed and reallocated (~1–2 ms).
+    // Extract stop string (empty string = no stop)
+    const char* stopChars = env->GetStringUTFChars(stopStr, nullptr);
+    std::string stopString(stopChars);
+    env->ReleaseStringUTFChars(stopStr, stopChars);
+
+    // Recreate context for a clean KV-cache slate before each inference.
     llama_free(ic->ctx);
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = ic->n_ctx;
@@ -142,19 +136,22 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         return;
     }
 
+    // Sampler: temperature → top-p → dist (prevents greedy repetition loops)
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.7f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-
     std::string fullOutput;
     std::string tokenBatch;
-    int batchCount  = 0;
+    int batchCount = 0;
     const int BATCH_SIZE = 6;
+    bool hitStop = false;
 
     for (int i = 0; i < (int)maxTokens; i++) {
         llama_token id = llama_sampler_sample(sampler, ic->ctx, -1);
+
+        // Model-native end-of-generation token
         if (llama_vocab_is_eog(vocab, id)) break;
 
         char buf[256];
@@ -162,12 +159,38 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         if (n <= 0) break;
 
         std::string piece(buf, n);
-        fullOutput  += piece;
-        tokenBatch  += piece;
+        fullOutput += piece;
+        tokenBatch += piece;
         batchCount++;
 
+        // ── Stop string check ─────────────────────────────────────────────
+        // This is the standard way every LLM runtime (ollama, llama-server,
+        // llmcpp) halts generation at a custom delimiter.  Different model
+        // families use different stop tokens:
+        //   Qwen:    <|im_end|>
+        //   Llama3:  <|eot_id|>
+        //   Mistral: </s>
+        //   Gemma:   <end_of_turn>
+        //   Phi:     <|end|>
+        // Passing "" disables the check entirely.
+        if (!stopString.empty() &&
+            fullOutput.size() >= stopString.size() &&
+            fullOutput.compare(fullOutput.size() - stopString.size(),
+                               stopString.size(), stopString) == 0) {
+
+            // Trim the stop string from both output buffers before breaking.
+            fullOutput.erase(fullOutput.size() - stopString.size());
+            if (tokenBatch.size() >= stopString.size()) {
+                tokenBatch.erase(tokenBatch.size() - stopString.size());
+            } else {
+                tokenBatch.clear();
+            }
+            hitStop = true;
+            break;
+        }
+
+        // Fire token batch every BATCH_SIZE pieces for smooth streaming.
         if (batchCount >= BATCH_SIZE) {
-            // env is valid here — this IS the Java executor thread, already attached.
             fireOnToken(env, ic, tokenBatch);
             tokenBatch.clear();
             batchCount = 0;
@@ -181,6 +204,7 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
 
     llama_sampler_free(sampler);
 
+    // Fire any remaining buffered tokens.
     if (!tokenBatch.empty()) {
         fireOnToken(env, ic, tokenBatch);
     }
@@ -199,11 +223,9 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeFreeModel(
     llama_free(ic->ctx);
     llama_model_free(ic->model);
 
-    // DO NOT call llama_backend_free() here.
-    // It tears down global GGML state (thread pools, memory arenas).
-    // Calling it between load/free/reload cycles leaves the backend in a
-    // half-freed state and causes a crash on the next nativeLoadModel call.
-    // The backend will be cleaned up automatically when the process exits.
+    // DO NOT call llama_backend_free() here — it tears down global GGML state
+    // and causes crashes on the next nativeLoadModel call.
+    // It runs automatically when the process exits.
 
     env->DeleteGlobalRef(ic->javaObj);
     delete ic;
