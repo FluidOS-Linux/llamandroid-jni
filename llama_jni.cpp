@@ -4,8 +4,6 @@
 #include "llama.h"
 #include "ggml.h"
 
-// ── Backend init guard ────────────────────────────────────────────────────────
-// llama_backend_init() must be called exactly once per process.
 static bool gBackendInitialized = false;
 
 struct InferenceContext {
@@ -17,12 +15,11 @@ struct InferenceContext {
     uint32_t       n_threads;
 };
 
-// ── Fire helpers ─────────────────────────────────────────────────────────────
-// IMPORTANT: do NOT call AttachCurrentThread / DetachCurrentThread here.
+// Do NOT call AttachCurrentThread / DetachCurrentThread here.
 // nativeInfer runs on a Java ExecutorService thread which is already attached.
-// Detaching it permanently breaks all subsequent JNI calls from that thread.
 
 static void fireOnToken(JNIEnv* env, InferenceContext* ic, const std::string& token) {
+    if (token.empty()) return;
     jclass    cls  = env->GetObjectClass(ic->javaObj);
     jmethodID mid  = env->GetMethodID(cls, "onToken", "(Ljava/lang/String;)V");
     jstring   jtok = env->NewStringUTF(token.c_str());
@@ -92,12 +89,11 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     InferenceContext* ic = (InferenceContext*) handle;
     if (!ic) return;
 
-    // Extract stop string (empty string = no stop)
     const char* stopChars = env->GetStringUTFChars(stopStr, nullptr);
     std::string stopString(stopChars);
     env->ReleaseStringUTFChars(stopStr, stopChars);
 
-    // Recreate context for a clean KV-cache slate before each inference.
+    // Recreate context for a clean KV-cache slate.
     llama_free(ic->ctx);
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = ic->n_ctx;
@@ -114,7 +110,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
 
     const llama_vocab* vocab = llama_model_get_vocab(ic->model);
 
-    // Tokenise with auto-sizing buffer.
     int bufSize = (int)promptCpp.size() + 128;
     std::vector<llama_token> tokens(bufSize);
     int nTokens = llama_tokenize(
@@ -129,29 +124,48 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     if (nTokens < 0) { fireOnComplete(env, ic, "[tokenization failed]"); return; }
     tokens.resize(nTokens);
 
-    // Decode the prompt.
     llama_batch batch = llama_batch_get_one(tokens.data(), nTokens);
     if (llama_decode(ic->ctx, batch) != 0) {
         fireOnComplete(env, ic, "[decode failed]");
         return;
     }
 
-    // Sampler: temperature → top-p → dist (prevents greedy repetition loops)
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.7f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-    std::string fullOutput;
-    std::string tokenBatch;
-    int batchCount = 0;
+    // ── Holdback buffer ───────────────────────────────────────────────────────
+    // This is the same approach used by ollama, llama-server, and every serious
+    // LLM streaming runtime.
+    //
+    // The problem: a stop string like "<|im_end|>" arrives as multiple token
+    // pieces across multiple decode steps. If we fire OnToken immediately for
+    // every piece, some pieces of the stop string will have already been sent
+    // to the UI before we realize a stop string was forming.
+    //
+    // The solution: maintain a "holdback" buffer that always retains the last
+    // N characters where N = stopString.size(). We only release characters from
+    // the front of the holdback to OnToken once we're certain they are not part
+    // of a forming stop string. If the stop string completes in the holdback,
+    // we discard it entirely and break. If generation ends normally, we release
+    // whatever clean content remains in the holdback.
+    //
+    // This guarantees: the stop string NEVER appears in any OnToken call, and
+    // OnComplete always receives perfectly clean output.
+
+    const size_t holdSize = stopString.empty() ? 0 : stopString.size();
+
+    std::string fullOutput;  // complete accumulated output (pre-strip)
+    std::string holdback;    // characters held back pending stop string check
     const int BATCH_SIZE = 6;
-    bool hitStop = false;
+    int batchCount = 0;
+    std::string tokenBatch;  // batched chars ready to fire via OnToken
 
     for (int i = 0; i < (int)maxTokens; i++) {
         llama_token id = llama_sampler_sample(sampler, ic->ctx, -1);
 
-        // Model-native end-of-generation token
+        // Native EOG token — stop immediately.
         if (llama_vocab_is_eog(vocab, id)) break;
 
         char buf[256];
@@ -160,37 +174,42 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
 
         std::string piece(buf, n);
         fullOutput += piece;
-        tokenBatch += piece;
-        batchCount++;
+        holdback   += piece;
 
-        // ── Stop string check ─────────────────────────────────────────────
-        // This is the standard way every LLM runtime (ollama, llama-server,
-        // llmcpp) halts generation at a custom delimiter.  Different model
-        // families use different stop tokens:
-        //   Qwen:    <|im_end|>
-        //   Llama3:  <|eot_id|>
-        //   Mistral: </s>
-        //   Gemma:   <end_of_turn>
-        //   Phi:     <|end|>
-        // Passing "" disables the check entirely.
-        if (!stopString.empty() &&
-            fullOutput.size() >= stopString.size() &&
-            fullOutput.compare(fullOutput.size() - stopString.size(),
-                               stopString.size(), stopString) == 0) {
-
-            // Trim the stop string from both output buffers before breaking.
-            fullOutput.erase(fullOutput.size() - stopString.size());
-            if (tokenBatch.size() >= stopString.size()) {
-                tokenBatch.erase(tokenBatch.size() - stopString.size());
-            } else {
-                tokenBatch.clear();
+        // ── Check if stop string has fully formed in the holdback ─────────
+        if (!stopString.empty()) {
+            size_t stopPos = holdback.find(stopString);
+            if (stopPos != std::string::npos) {
+                // Stop string found. Release everything before it as clean
+                // output, discard the stop string and everything after.
+                std::string safeChunk = holdback.substr(0, stopPos);
+                tokenBatch += safeChunk;
+                if (!tokenBatch.empty()) {
+                    fireOnToken(env, ic, tokenBatch);
+                    tokenBatch.clear();
+                }
+                // Trim fullOutput to match what we actually sent.
+                size_t fullStopPos = fullOutput.find(stopString);
+                if (fullStopPos != std::string::npos) {
+                    fullOutput = fullOutput.substr(0, fullStopPos);
+                }
+                break;
             }
-            hitStop = true;
-            break;
+
+            // No complete stop string yet. Release safe characters from the
+            // front of holdback — only keep the last holdSize chars back.
+            if (holdback.size() > holdSize) {
+                std::string safe = holdback.substr(0, holdback.size() - holdSize);
+                holdback = holdback.substr(holdback.size() - holdSize);
+                tokenBatch += safe;
+            }
+        } else {
+            // No stop string — everything is safe to release immediately.
+            tokenBatch += piece;
         }
 
-        // Fire token batch every BATCH_SIZE pieces for smooth streaming.
-        if (batchCount >= BATCH_SIZE) {
+        // Fire OnToken in batches for smooth streaming.
+        if ((int)tokenBatch.size() >= BATCH_SIZE) {
             fireOnToken(env, ic, tokenBatch);
             tokenBatch.clear();
             batchCount = 0;
@@ -204,10 +223,30 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
 
     llama_sampler_free(sampler);
 
-    // Fire any remaining buffered tokens.
+    // ── Flush remaining safe content ──────────────────────────────────────
+    // If generation ended normally (EOG or maxTokens), release whatever is
+    // left in the holdback. It contains no stop string (we would have broken
+    // out of the loop already if it did), so it's safe to send.
+    if (!stopString.empty() && !holdback.empty()) {
+        // Final check: strip any partial stop string prefix at the very end.
+        // e.g. output ends with "<|im_end" — trim that partial match.
+        for (size_t len = stopString.size() - 1; len >= 1; len--) {
+            if (holdback.size() >= len &&
+                holdback.compare(holdback.size() - len, len,
+                                 stopString, 0, len) == 0) {
+                holdback.erase(holdback.size() - len);
+                fullOutput.erase(fullOutput.size() - len);
+                break;
+            }
+        }
+        tokenBatch += holdback;
+    }
+
     if (!tokenBatch.empty()) {
         fireOnToken(env, ic, tokenBatch);
     }
+
+    // OnComplete fires with the same clean output that was streamed.
     fireOnComplete(env, ic, fullOutput);
 }
 
@@ -223,10 +262,7 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeFreeModel(
     llama_free(ic->ctx);
     llama_model_free(ic->model);
 
-    // DO NOT call llama_backend_free() here — it tears down global GGML state
-    // and causes crashes on the next nativeLoadModel call.
-    // It runs automatically when the process exits.
-
+    // Do NOT call llama_backend_free() here.
     env->DeleteGlobalRef(ic->javaObj);
     delete ic;
 }
