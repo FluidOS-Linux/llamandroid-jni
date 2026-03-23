@@ -136,31 +136,16 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
     // ── Holdback buffer ───────────────────────────────────────────────────────
-    // This is the same approach used by ollama, llama-server, and every serious
-    // LLM streaming runtime.
-    //
-    // The problem: a stop string like "<|im_end|>" arrives as multiple token
-    // pieces across multiple decode steps. If we fire OnToken immediately for
-    // every piece, some pieces of the stop string will have already been sent
-    // to the UI before we realize a stop string was forming.
-    //
-    // The solution: maintain a "holdback" buffer that always retains the last
-    // N characters where N = stopString.size(). We only release characters from
-    // the front of the holdback to OnToken once we're certain they are not part
-    // of a forming stop string. If the stop string completes in the holdback,
-    // we discard it entirely and break. If generation ends normally, we release
-    // whatever clean content remains in the holdback.
-    //
-    // This guarantees: the stop string NEVER appears in any OnToken call, and
-    // OnComplete always receives perfectly clean output.
-
+    // Retains the last stopString.size() characters at all times.
+    // Only releases characters from the front once we are certain they are
+    // not part of a forming stop string. This is the standard approach used
+    // by ollama, llama-server, and all serious LLM streaming runtimes.
     const size_t holdSize = stopString.empty() ? 0 : stopString.size();
 
-    std::string fullOutput;  // complete accumulated output (pre-strip)
-    std::string holdback;    // characters held back pending stop string check
+    std::string fullOutput;
+    std::string holdback;
+    std::string tokenBatch;
     const int BATCH_SIZE = 6;
-    int batchCount = 0;
-    std::string tokenBatch;  // batched chars ready to fire via OnToken
 
     for (int i = 0; i < (int)maxTokens; i++) {
         llama_token id = llama_sampler_sample(sampler, ic->ctx, -1);
@@ -169,26 +154,29 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         if (llama_vocab_is_eog(vocab, id)) break;
 
         char buf[256];
-        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, false);
+        // special=true: decode special tokens to their text representation
+        // (e.g. <|im_end|>) so the holdback can match them against stopString.
+        // With special=false, special tokens return n<=0 inconsistently,
+        // causing the stop string to slip through undetected.
+        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n <= 0) break;
 
         std::string piece(buf, n);
         fullOutput += piece;
         holdback   += piece;
 
-        // ── Check if stop string has fully formed in the holdback ─────────
+        // ── Stop string detection ─────────────────────────────────────────
         if (!stopString.empty()) {
             size_t stopPos = holdback.find(stopString);
             if (stopPos != std::string::npos) {
-                // Stop string found. Release everything before it as clean
-                // output, discard the stop string and everything after.
+                // Stop string found. Release everything before it, discard rest.
                 std::string safeChunk = holdback.substr(0, stopPos);
                 tokenBatch += safeChunk;
                 if (!tokenBatch.empty()) {
                     fireOnToken(env, ic, tokenBatch);
                     tokenBatch.clear();
                 }
-                // Trim fullOutput to match what we actually sent.
+                // Trim fullOutput to match what was actually sent.
                 size_t fullStopPos = fullOutput.find(stopString);
                 if (fullStopPos != std::string::npos) {
                     fullOutput = fullOutput.substr(0, fullStopPos);
@@ -196,15 +184,13 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
                 break;
             }
 
-            // No complete stop string yet. Release safe characters from the
-            // front of holdback — only keep the last holdSize chars back.
+            // Release safe characters from the front of holdback.
             if (holdback.size() > holdSize) {
                 std::string safe = holdback.substr(0, holdback.size() - holdSize);
                 holdback = holdback.substr(holdback.size() - holdSize);
                 tokenBatch += safe;
             }
         } else {
-            // No stop string — everything is safe to release immediately.
             tokenBatch += piece;
         }
 
@@ -212,7 +198,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         if ((int)tokenBatch.size() >= BATCH_SIZE) {
             fireOnToken(env, ic, tokenBatch);
             tokenBatch.clear();
-            batchCount = 0;
         }
 
         llama_sampler_accept(sampler, id);
@@ -223,13 +208,12 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
 
     llama_sampler_free(sampler);
 
-    // ── Flush remaining safe content ──────────────────────────────────────
-    // If generation ended normally (EOG or maxTokens), release whatever is
-    // left in the holdback. It contains no stop string (we would have broken
-    // out of the loop already if it did), so it's safe to send.
+    // ── Flush remaining safe holdback content ─────────────────────────────
+    // Generation ended normally (EOG or maxTokens). Release whatever is left
+    // in the holdback — it contains no stop string or we would have broken
+    // out of the loop already.
     if (!stopString.empty() && !holdback.empty()) {
-        // Final check: strip any partial stop string prefix at the very end.
-        // e.g. output ends with "<|im_end" — trim that partial match.
+        // Trim any partial stop string prefix at the very end.
         for (size_t len = stopString.size() - 1; len >= 1; len--) {
             if (holdback.size() >= len &&
                 holdback.compare(holdback.size() - len, len,
