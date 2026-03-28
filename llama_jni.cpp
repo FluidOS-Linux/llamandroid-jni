@@ -110,16 +110,19 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
 
     const llama_vocab* vocab = llama_model_get_vocab(ic->model);
 
+    // parse_special=true: tokenize <|im_start|>, <|im_end|> etc. as the actual
+    // special tokens the model was trained on, not as literal text characters.
+    // Without this the model never sees a properly formatted chat template.
     int bufSize = (int)promptCpp.size() + 128;
     std::vector<llama_token> tokens(bufSize);
     int nTokens = llama_tokenize(
         vocab, promptCpp.c_str(), (int)promptCpp.size(),
-        tokens.data(), (int)tokens.size(), true, false);
+        tokens.data(), (int)tokens.size(), true, true);   // ← parse_special=true
     if (nTokens < 0) {
         tokens.resize(-nTokens + 1);
         nTokens = llama_tokenize(
             vocab, promptCpp.c_str(), (int)promptCpp.size(),
-            tokens.data(), (int)tokens.size(), true, false);
+            tokens.data(), (int)tokens.size(), true, true); // ← here too
     }
     if (nTokens < 0) { fireOnComplete(env, ic, "[tokenization failed]"); return; }
     tokens.resize(nTokens);
@@ -138,8 +141,8 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     // ── Holdback buffer ───────────────────────────────────────────────────────
     // Retains the last stopString.size() characters at all times.
     // Only releases characters from the front once we are certain they are
-    // not part of a forming stop string. This is the standard approach used
-    // by ollama, llama-server, and all serious LLM streaming runtimes.
+    // not part of a forming stop string. Standard approach used by ollama,
+    // llama-server, and all serious LLM streaming runtimes.
     const size_t holdSize = stopString.empty() ? 0 : stopString.size();
 
     std::string fullOutput;
@@ -150,14 +153,14 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     for (int i = 0; i < (int)maxTokens; i++) {
         llama_token id = llama_sampler_sample(sampler, ic->ctx, -1);
 
-        // Native EOG token — stop immediately.
+        // Native EOG token — now fires reliably because the prompt was
+        // tokenized with parse_special=true, so the model actually sees
+        // the chat template and knows when to stop.
         if (llama_vocab_is_eog(vocab, id)) break;
 
         char buf[256];
         // special=true: decode special tokens to their text representation
-        // (e.g. <|im_end|>) so the holdback can match them against stopString.
-        // With special=false, special tokens return n<=0 inconsistently,
-        // causing the stop string to slip through undetected.
+        // so the holdback can match them against stopString.
         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n <= 0) break;
 
@@ -176,7 +179,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
                     fireOnToken(env, ic, tokenBatch);
                     tokenBatch.clear();
                 }
-                // Trim fullOutput to match what was actually sent.
                 size_t fullStopPos = fullOutput.find(stopString);
                 if (fullStopPos != std::string::npos) {
                     fullOutput = fullOutput.substr(0, fullStopPos);
@@ -194,7 +196,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
             tokenBatch += piece;
         }
 
-        // Fire OnToken in batches for smooth streaming.
         if ((int)tokenBatch.size() >= BATCH_SIZE) {
             fireOnToken(env, ic, tokenBatch);
             tokenBatch.clear();
@@ -209,11 +210,7 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     llama_sampler_free(sampler);
 
     // ── Flush remaining safe holdback content ─────────────────────────────
-    // Generation ended normally (EOG or maxTokens). Release whatever is left
-    // in the holdback — it contains no stop string or we would have broken
-    // out of the loop already.
     if (!stopString.empty() && !holdback.empty()) {
-        // Trim any partial stop string prefix at the very end.
         for (size_t len = stopString.size() - 1; len >= 1; len--) {
             if (holdback.size() >= len &&
                 holdback.compare(holdback.size() - len, len,
@@ -230,7 +227,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         fireOnToken(env, ic, tokenBatch);
     }
 
-    // OnComplete fires with the same clean output that was streamed.
     fireOnComplete(env, ic, fullOutput);
 }
 
