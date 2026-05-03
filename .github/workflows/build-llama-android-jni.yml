@@ -1,4 +1,4 @@
-name: Build llama.cpp + JNI for Android ARM64 (fat .so)
+name: build llama.cpp + JNI for Android ARM64 (fat .so)
 
 on:
   push:
@@ -10,37 +10,33 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout llama.cpp
+      - name: checkout llama.cpp
         uses: actions/checkout@v4
         with:
           repository: ggerganov/llama.cpp
           ref: master
 
-      - name: Download llama_jni.cpp from your repo
+      - name: download llama_jni.cpp from repo
         run: |
           curl -fsSL https://raw.githubusercontent.com/FluidOS-Linux/llamandroid-jni/main/llama_jni.cpp -o llama_jni.cpp
 
-      - name: Setup Android SDK
+      - name: setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install NDK and CMake
+      - name: install NDK and CMake
         run: echo "y" | sdkmanager "ndk;26.3.11579264" "cmake;3.22.1"
 
-      - name: Build llama.cpp static libs + fat JNI .so for Android ARM64
+      - name: build llama.cpp static libs + fat JNI .so for Android ARM64
         run: |
           export ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/26.3.11579264
           export TOOLCHAIN=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64
           export CXX=$TOOLCHAIN/bin/aarch64-linux-android28-clang++
           export SYSROOT=$TOOLCHAIN/sysroot
-
-          # ── Explicit aarch64 libc++ paths (no find, no wrong arch) ──────────
           export LIBCXX=$SYSROOT/usr/lib/aarch64-linux-android/libc++_static.a
           export LIBCXXABI=$SYSROOT/usr/lib/aarch64-linux-android/libc++abi.a
 
-          echo "Checking libc++ paths:"
           ls -lh $LIBCXX $LIBCXXABI
 
-          # ── Step 1: Build llama.cpp as STATIC libs ───────────────────────────
           mkdir build-android && cd build-android
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
@@ -56,12 +52,9 @@ jobs:
           cmake --build . --config Release -j4
           cd ..
 
-          # ── Step 2: Collect all static libs ─────────────────────────────────
-          echo "Static libs found:"
           find build-android -name "*.a" | sort
           STATIC_LIBS=$(find build-android -name "*.a" | tr '\n' ' ')
 
-          # ── Step 3: Compile fat libllamajni.so ──────────────────────────────
           mkdir -p output
           $CXX \
             -shared -fPIC \
@@ -79,13 +72,10 @@ jobs:
             -llog -lm -lz -landroid -ldl -lc \
             -o output/libllamajni.so
 
-          echo "✅ Fat .so built:"
           ls -lh output/libllamajni.so
-
-          echo "Dependencies:"
           $TOOLCHAIN/bin/llvm-readelf -d output/libllamajni.so | grep NEEDED
 
-      - name: Upload artifact
+      - name: upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: llama-android-arm64-fat-jni
