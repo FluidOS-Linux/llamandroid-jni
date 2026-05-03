@@ -15,9 +15,6 @@ struct InferenceContext {
     uint32_t       n_threads;
 };
 
-// Do NOT call AttachCurrentThread / DetachCurrentThread here.
-// nativeInfer runs on a Java ExecutorService thread which is already attached.
-
 static void fireOnToken(JNIEnv* env, InferenceContext* ic, const std::string& token) {
     if (token.empty()) return;
     jclass    cls  = env->GetObjectClass(ic->javaObj);
@@ -36,8 +33,6 @@ static void fireOnComplete(JNIEnv* env, InferenceContext* ic, const std::string&
     env->DeleteLocalRef(jtext);
     env->DeleteLocalRef(cls);
 }
-
-// ── nativeLoadModel ───────────────────────────────────────────────────────────
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_pocketive_llamandroid_LlamaAndroid_nativeLoadModel(
@@ -79,11 +74,9 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeLoadModel(
     return (jlong) ic;
 }
 
-// ── nativeInfer ──────────────────────────────────────────────────────────────
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
-        JNIEnv* env, jobject /*obj*/,
+        JNIEnv* env, jobject,
         jlong handle, jstring prompt, jint maxTokens, jstring stopStr) {
 
     InferenceContext* ic = (InferenceContext*) handle;
@@ -93,7 +86,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     std::string stopString(stopChars);
     env->ReleaseStringUTFChars(stopStr, stopChars);
 
-    // Recreate context for a clean KV-cache slate.
     llama_free(ic->ctx);
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = ic->n_ctx;
@@ -110,19 +102,16 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
 
     const llama_vocab* vocab = llama_model_get_vocab(ic->model);
 
-    // parse_special=true: tokenize <|im_start|>, <|im_end|> etc. as the actual
-    // special tokens the model was trained on, not as literal text characters.
-    // Without this the model never sees a properly formatted chat template.
     int bufSize = (int)promptCpp.size() + 128;
     std::vector<llama_token> tokens(bufSize);
     int nTokens = llama_tokenize(
         vocab, promptCpp.c_str(), (int)promptCpp.size(),
-        tokens.data(), (int)tokens.size(), true, true);   // ← parse_special=true
+        tokens.data(), (int)tokens.size(), true, true);
     if (nTokens < 0) {
         tokens.resize(-nTokens + 1);
         nTokens = llama_tokenize(
             vocab, promptCpp.c_str(), (int)promptCpp.size(),
-            tokens.data(), (int)tokens.size(), true, true); // ← here too
+            tokens.data(), (int)tokens.size(), true, true);
     }
     if (nTokens < 0) { fireOnComplete(env, ic, "[tokenization failed]"); return; }
     tokens.resize(nTokens);
@@ -138,11 +127,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-    // ── Holdback buffer ───────────────────────────────────────────────────────
-    // Retains the last stopString.size() characters at all times.
-    // Only releases characters from the front once we are certain they are
-    // not part of a forming stop string. Standard approach used by ollama,
-    // llama-server, and all serious LLM streaming runtimes.
     const size_t holdSize = stopString.empty() ? 0 : stopString.size();
 
     std::string fullOutput;
@@ -153,14 +137,9 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     for (int i = 0; i < (int)maxTokens; i++) {
         llama_token id = llama_sampler_sample(sampler, ic->ctx, -1);
 
-        // Native EOG token — now fires reliably because the prompt was
-        // tokenized with parse_special=true, so the model actually sees
-        // the chat template and knows when to stop.
         if (llama_vocab_is_eog(vocab, id)) break;
 
         char buf[256];
-        // special=true: decode special tokens to their text representation
-        // so the holdback can match them against stopString.
         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n <= 0) break;
 
@@ -168,11 +147,9 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
         fullOutput += piece;
         holdback   += piece;
 
-        // ── Stop string detection ─────────────────────────────────────────
         if (!stopString.empty()) {
             size_t stopPos = holdback.find(stopString);
             if (stopPos != std::string::npos) {
-                // Stop string found. Release everything before it, discard rest.
                 std::string safeChunk = holdback.substr(0, stopPos);
                 tokenBatch += safeChunk;
                 if (!tokenBatch.empty()) {
@@ -186,7 +163,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
                 break;
             }
 
-            // Release safe characters from the front of holdback.
             if (holdback.size() > holdSize) {
                 std::string safe = holdback.substr(0, holdback.size() - holdSize);
                 holdback = holdback.substr(holdback.size() - holdSize);
@@ -209,7 +185,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
 
     llama_sampler_free(sampler);
 
-    // ── Flush remaining safe holdback content ─────────────────────────────
     if (!stopString.empty() && !holdback.empty()) {
         for (size_t len = stopString.size() - 1; len >= 1; len--) {
             if (holdback.size() >= len &&
@@ -230,11 +205,9 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeInfer(
     fireOnComplete(env, ic, fullOutput);
 }
 
-// ── nativeFreeModel ──────────────────────────────────────────────────────────
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_pocketive_llamandroid_LlamaAndroid_nativeFreeModel(
-        JNIEnv* env, jobject /*obj*/, jlong handle) {
+        JNIEnv* env, jobject, jlong handle) {
 
     InferenceContext* ic = (InferenceContext*) handle;
     if (!ic) return;
@@ -242,7 +215,6 @@ Java_com_pocketive_llamandroid_LlamaAndroid_nativeFreeModel(
     llama_free(ic->ctx);
     llama_model_free(ic->model);
 
-    // Do NOT call llama_backend_free() here.
     env->DeleteGlobalRef(ic->javaObj);
     delete ic;
 }
